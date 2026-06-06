@@ -1,66 +1,127 @@
-import asyncio
-import re
-from pyrogram import Client
-from pyrogram.errors import FloodWait
+import os
+import threading
+from flask import Flask
+import telebot
 
-# --- CONFIGURATION AREA ---
-API_ID = 1234567          # Replace with your 7-digit API ID
-API_HASH = "your_api_hash"  # Replace with your API Hash string
+# --- CONFIGURATION ---
+# We fetch the token securely from Render's Environment Variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ---------------------
 
-# Target Chat/Channel ID (Can be an integer like -100123456789 or a username like "@my_channel")
-CHAT_ID = -100123456789   
+bot = telebot.TeleBot(BOT_TOKEN)
+user_sessions = {}
 
-# If you want to run this as a regular bot, put your token here. 
-# If left as None, it will run as a Userbot (logging into your personal account).
-BOT_TOKEN = None  
-# --------------------------
+# Mini web server to satisfy Render's port check
+flask_app = Flask(__name__)
 
-if BOT_TOKEN:
-    app = Client("caption_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-else:
-    app = Client("caption_user", api_id=API_ID, api_hash=API_HASH)
+@flask_app.route('/')
+def home():
+    return "Bot is running perfectly!", 200
 
-async def main():
-    async with app:
-        print("🤖 Script started! Fetching messages...")
-        updated_count = 0
+@bot.message_handler(commands=['start'])
+def start_session(message):
+    user_sessions[message.chat.id] = {"grade_12": [], "grade_13": [], "unknown": []}
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+
+@bot.message_handler(content_types=['document', 'video', 'photo'])
+def gather_files(message):
+    chat_id = message.chat.id
+    if chat_id not in user_sessions:
+        user_sessions[chat_id] = {"grade_12": [], "grade_13": [], "unknown": []}
         
-        # Regex pattern to find the specific block text regardless of extra spaces or newlines
-        # This looks for "2020", followed by "#COMBINED_MATHS", followed by "@SL_EDUCATION_A_L"
-        target_pattern = r"2020\s*#COMBINED_MATHS\s*@SL_EDUCATION_A_L"
-        replacement_text = "@Combine27"
+    if not message.caption:
+        try:
+            bot.delete_message(chat_id, message.message_id)
+        except Exception:
+            pass
+        return
 
-        # Iterate through all messages in the chat history
-        async for message in app.get_chat_history(CHAT_ID):
-            # Check if the message contains a media file with a caption
-            if message.caption:
-                old_caption = message.caption
-                
-                # Check if our target pattern exists in the caption
-                if re.search(target_pattern, old_caption, re.IGNORECASE):
-                    # Perform the replacement
-                    new_caption = re.sub(target_pattern, replacement_text, old_caption, flags=re.IGNORECASE)
-                    
-                    try:
-                        # Update the caption on Telegram
-                        await app.edit_message_caption(
-                            chat_id=CHAT_ID,
-                            message_id=message.id,
-                            caption=new_caption
-                        )
-                        updated_count += 1
-                        print(f"✅ [{updated_count}] Updated caption for Message ID: {message.id}")
-                        
-                        # Short pause to prevent hitting Telegram's rate limits too fast
-                        await asyncio.sleep(1)
-                        
-                    except FloodWait as e:
-                        print(f"⚠️ Hit Telegram rate limit. Sleeping for {e.value} seconds...")
-                        await asyncio.sleep(e.value)
-                    except Exception as e:
-                        print(f"❌ Failed to update message {message.id}: {e}")
-        
-        print(f"\n🎉 Task complete! Successfully updated {updated_count} captions.")
+    file_data = {
+        "type": message.content_type,
+        "caption": message.caption,
+        "file_id": message.document.file_id if message.content_type == 'document' else 
+                   (message.video.file_id if message.content_type == 'video' else message.photo[-1].file_id)
+    }
+
+    caption_upper = message.caption.upper()
+    if "GRADE 12" in caption_upper or "GR 12" in caption_upper:
+        user_sessions[chat_id]["grade_12"].append(file_data)
+    elif "GRADE 13" in caption_upper or "GR 13" in caption_upper:
+        user_sessions[chat_id]["grade_13"].append(file_data)
+    else:
+        user_sessions[chat_id]["unknown"].append(file_data)
+
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+
+@bot.message_handler(commands=['done'])
+def process_in_order(message):
+    chat_id = message.chat.id
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+
+    if chat_id not in user_sessions:
+        return
+
+    session = user_sessions[chat_id]
+    g12_count = len(session["grade_12"])
+    g13_count = len(session["grade_13"])
+    unk_count = len(session["unknown"])
+
+    def process_and_send(item):
+        lines = item["caption"].split('\n')
+        cleaned_lines = [line for line in lines if '#' not in line and '@' not in line]
+        new_caption = "\n".join(cleaned_lines).strip() + "\n@Combine27"
+
+        if item["type"] == 'document':
+            bot.send_document(chat_id, item["file_id"], caption=new_caption)
+        elif item["type"] == 'video':
+            bot.send_video(chat_id, item["file_id"], caption=new_caption)
+        elif item["type"] == 'photo':
+            bot.send_photo(chat_id, item["file_id"], caption=new_caption)
+
+    if g12_count > 0:
+        bot.send_message(chat_id, "✨ **GRADE 12 FILES** ✨", parse_mode="Markdown")
+        for item in session["grade_12"]:
+            process_and_send(item)
+
+    if g13_count > 0:
+        bot.send_message(chat_id, "✨ **GRADE 13 FILES** ✨", parse_mode="Markdown")
+        for item in session["grade_13"]:
+            process_and_send(item)
+
+    if unk_count > 0:
+        bot.send_message(chat_id, "✨ **UNCLASSIFIED FILES** ✨", parse_mode="Markdown")
+        for item in session["unknown"]:
+            process_and_send(item)
+
+    total_processed = g12_count + g13_count + unk_count
+    summary_text = (
+        "📊 **Execution Summary**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Total Files Processed: {total_processed}\n"
+        f"📂 Grade 12 Files: {g12_count}\n"
+        f"📂 Grade 13 Files: {g13_count}\n"
+        f"❓ Unclassified Files: {unk_count}\n\n"
+        "All tags successfully updated to @Combine27!"
+    )
+    bot.send_message(chat_id, summary_text, parse_mode="Markdown")
+    del user_sessions[chat_id]
+
+# Function to run the Telegram Bot polling loop
+def run_telegram_bot():
+    bot.infinity_polling()
 
 if __name__ == "__main__":
-    app.run(main())
+    # Start Telegram Bot loop in a separate thread
+    threading.Thread(target=run_telegram_bot, daemon=True).start()
+    # Run Flask App to keep Render alive
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
